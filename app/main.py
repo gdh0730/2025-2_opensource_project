@@ -11,7 +11,7 @@ from .schemas import (
     RoadPredictRequest, RoadForecastResponse,
     FetchSpeedRequest, FetchVolumeRequest,
     SeedSpeedDummyRequest, BackfillVolumeRequest,
-    SeedRoadSpeedDummyRequest, BackfillRoadVolumeRequest,
+    SeedRoadSpeedDummyRequest, BackfillRoadVolumeRequest, 
 )
 from .services import (
     fetch_speed_from_topis, fetch_volume_from_topis,
@@ -20,7 +20,7 @@ from .services import (
     warm_up_models,
     get_static_meta,
     seed_speed_dummy, backfill_volume,
-    seed_speed_dummy_for_road, backfill_volume_for_road,
+    seed_speed_dummy_for_road, backfill_volume_for_road, fetch_volume_from_topis_all, 
 )
 
 from datetime import datetime, timezone, timedelta
@@ -92,8 +92,8 @@ def list_spots_of_road(road_name: str):
     spots = []
     for sid, meta in (static_meta.vol_meta or {}).items():
         if meta["road_name"] == road_name and "_" in sid:
-            spot_num, direction = sid.split("_", 1)
-            spots.append({"spot_num": spot_num, "direction": direction, "spot_name": meta["spot_name"]})
+            spot_num, io_dir = sid.split("_", 1)
+            spots.append({"spot_num": spot_num, "io_direction": io_dir, "spot_name": meta["spot_name"]})
     if not spots:
         raise HTTPException(status_code=404, detail="해당 도로의 교통량 지점이 없습니다.")
     return {"road_name": road_name, "spots": spots}
@@ -119,30 +119,30 @@ async def api_fetch_volume(req: FetchVolumeRequest, db: Session = Depends(get_db
     ymd = req.ymd or kst.strftime("%Y%m%d")
     hh = req.hh or kst.strftime("%H")
 
-    kst_now = datetime.now(timezone(timedelta(hours=9)))
-    ts_kst = kst_now.replace(minute=0, second=0, microsecond=0)
+    ts_kst = kst.replace(minute=0, second=0, microsecond=0)
 
-    # ✅ io_type이 None이면 유입(1) + 유출(2)을 각각 저장 (합산 문자열 저장 금지)
+    all_map = await fetch_volume_from_topis_all(req.spot_num, ymd=ymd, hh=hh)
+
+    target_io_types = [1, 2] if req.io_type is None else [req.io_type]
+    if any(t not in (1, 2) for t in target_io_types):
+        raise HTTPException(status_code=400, detail="io_type은 1/2 또는 None")
+
     results = []
+    for t in target_io_types:
+        if t not in all_map:
+            continue
+        total_vol, lane_cnt = all_map[t]
+        io_dir = "유입" if t == 1 else "유출"
+        upsert_volume_hist(db, req.spot_num, io_dir, ts_kst, int(total_vol), int(lane_cnt))
+        results.append({
+            "spot_num": req.spot_num,
+            "io_direction": io_dir,
+            "ts": ts_kst,
+            "vol": int(total_vol),
+            "lane_cnt": int(lane_cnt),
+        })
 
-    if req.io_type is None:
-        for io_type, direction in [(1, "유입"), (2, "유출")]:
-            total_vol, lane_cnt = await fetch_volume_from_topis(req.spot_num, ymd=ymd, hh=hh, io_type=io_type)
-            upsert_volume_hist(db, req.spot_num, direction, ts_kst, total_vol, lane_cnt)
-            results.append({"spot_num": req.spot_num, "direction": direction, "ts": ts_kst, "vol": total_vol, "lane_cnt": lane_cnt})
-        return {"spot_num": req.spot_num, "results": results}
-
-    # ✅ io_type이 1 또는 2면 해당 방향만 저장
-    if req.io_type == 1:
-        direction = "유입"
-    elif req.io_type == 2:
-        direction = "유출"
-    else:
-        raise HTTPException(status_code=400, detail="io_type은 1(유입) 또는 2(유출) 또는 None 이어야 합니다.")
-
-    total_vol, lane_cnt = await fetch_volume_from_topis(req.spot_num, ymd=ymd, hh=hh, io_type=req.io_type)
-    upsert_volume_hist(db, req.spot_num, direction, ts_kst, total_vol, lane_cnt)
-    return {"spot_num": req.spot_num, "direction": direction, "ts": ts_kst, "vol": total_vol, "lane_cnt": lane_cnt}
+    return {"spot_num": req.spot_num, "results": results}
 
 
 @app.post("/api/admin/seed-speed-dummy")
@@ -192,15 +192,8 @@ async def api_backfill_road_volume(req: BackfillRoadVolumeRequest, db: Session =
         road_name=req.road_name,
         hours=req.hours,
         end_ts=req.end_ts,
-        io_type=req.io_type,
-        directions=req.directions,
+        io_directions=req.io_directions,
     )
-
-'''@app.post("/api/admin/backfill-road-all")
-async def api_backfill_road_all(req: BackfillRoadAllRequest, db: Session = Depends(get_db)):
-    speed_res = seed_speed_dummy_for_road(...)
-    vol_res = await backfill_volume_for_road(...)
-    return {"speed": speed_res, "volume": vol_res}'''
 
 
 # ------------------------------------------------

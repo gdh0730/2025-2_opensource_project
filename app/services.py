@@ -44,6 +44,15 @@ def safe_torch_load(path, map_location="cpu"):
     except TypeError:
         return torch.load(path, map_location=map_location)
 
+# ----------------------------
+# io_type <-> io_direction 매핑 (교통량 전용)
+# ----------------------------
+IO_TYPE_TO_DIR = {1: "유입", 2: "유출"}
+DIR_TO_IO_TYPE = {"유입": 1, "유출": 2}
+
+def _ymd_hh_from_ts(ts_kst: datetime) -> Tuple[str, str]:
+    return ts_kst.strftime("%Y%m%d"), ts_kst.strftime("%H")
+
 def _kst_hour_floor(dt: Optional[datetime]) -> datetime:
     """
     dt가 None이면 now(KST) 정시로 내림.
@@ -87,31 +96,29 @@ class StaticMeta:
             raise KeyError(f"speed_meta에 없는 link_id: {link_id}")
         return self.speed_meta[link_id]
 
-    def get_vol_meta(self, spot_num: str, direction: str) -> dict:
-        sid = f"{spot_num}_{direction}"
+    def get_vol_meta(self, spot_num: str, io_direction: str) -> dict:
+        sid = f"{spot_num}_{io_direction}"
         if sid not in self.vol_meta:
             raise KeyError(f"vol_meta에 없는 spot_dir_id: {sid}")
         return self.vol_meta[sid]
 
     def find_links_by_road(self, road_name: str) -> List[str]:
         rn = _norm(road_name)
-        return [lid for lid, m in self.speed_meta.items() if _norm(m.get("road_name","")) == rn]
+        return [lid for lid, m in self.speed_meta.items() if _norm(m.get("road_name", "")) == rn]
 
-    def find_spot_dirs_by_road(self, road_name: str, directions = None) -> List[str]:
+    def find_spot_dirs_by_road(self, road_name: str, io_directions=None) -> List[str]:
         rn = _norm(road_name)
-        out=[]
+        out = []
         for sid, m in self.vol_meta.items():
-            if _norm(m.get("road_name","")) != rn:
+            if _norm(m.get("road_name", "")) != rn:
                 continue
-            # sid = "{spot_num}_{direction}"
             if "_" not in sid:
                 continue
-            spot_num, direction = sid.split("_", 1)
-            if directions and direction not in directions:
+            spot_num, io_dir = sid.split("_", 1)
+            if io_directions and io_dir not in io_directions:
                 continue
             out.append(sid)
         return out
-
 
 @lru_cache(maxsize=1)
 def get_static_meta() -> StaticMeta:
@@ -393,21 +400,21 @@ class VolumeModelWrapper:
         return X_dyn, last_vol, last_ts_kst
 
     def predict(
-        self,
-        spot_num: str,
-        direction: str,
-        hist_df: pd.DataFrame,
-        horizon: int,
-        anchor_end_ts_kst: Optional[datetime] = None,
+    self,
+    spot_num: str,
+    io_direction: str,
+    hist_df: pd.DataFrame,
+    horizon: int,
+    anchor_end_ts_kst: Optional[datetime] = None,
     ) -> Tuple[np.ndarray, List[datetime], datetime]:
-        sid = f"{spot_num}_{direction}"
+        sid = f"{spot_num}_{io_direction}"
         if sid not in self.spot_id_to_idx:
             raise ValueError(f"학습에 사용되지 않은 spot_dir_id: {sid}")
 
         H_use = min(horizon, self.H)
 
         X_dyn, last_vol, last_ts_kst = self._build_dyn_features(hist_df, anchor_end_ts_kst)
-        meta = get_static_meta().get_vol_meta(spot_num, direction)
+        meta = get_static_meta().get_vol_meta(spot_num, io_direction)
         x_static = np.array([meta["spot_mean_vol"], meta["spot_max_vol"]], dtype=float)
 
         X_dyn_scaled = self.scaler_dynamic.transform(X_dyn).reshape(1, self.T, -1)
@@ -484,30 +491,65 @@ async def fetch_speed_from_topis(link_id: str) -> Tuple[float, Optional[float]]:
         trv = float(m_trv.group(1)) if m_trv else None
         return spd, trv
 
-
-async def fetch_volume_from_topis(spot_num: str, ymd: str, hh: str,
-                                 io_type: Optional[int] = None) -> Tuple[int, int]:
-    url = f"{settings.TOPIS_BASE_URL}/{settings.TOPIS_API_KEY}/xml/VolInfo/1/100/{spot_num}/{ymd}/{hh}/"
-    async with httpx.AsyncClient(timeout=5.0) as client:
+# ----------------------------
+# ✅ TOPIS VolInfo: "항상 1회 호출" → 응답에서 io_type별 합산 정규화
+# ----------------------------
+async def fetch_volume_from_topis_all(
+    spot_num: str,
+    ymd: str,
+    hh: str,
+    start_index: int = 1,
+    end_index: int = 200,
+) -> Dict[int, Tuple[int, int]]:
+    """
+    return: { io_type: (total_vol, lane_cnt) }
+      - io_type별로 lane별 vol 합산
+      - lane_cnt는 (해당 io_type의 고유 lane_num 개수)
+    """
+    url = f"{settings.TOPIS_BASE_URL}/{settings.TOPIS_API_KEY}/xml/VolInfo/{start_index}/{end_index}/{spot_num}/{ymd}/{hh}/"
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url)
         r.raise_for_status()
         text = r.text
 
-        import re
-        rows = re.findall(
-            rf"<row>.*?<io_type>(\d+)</io_type>.*?<lane_num>(\d+)</lane_num>.*?<vol>{number_pattern}</vol>.*?</row>",
-            text,
-            flags=re.DOTALL,
-        )
-        total_vol = 0
-        lane_nums = set()
-        for io, lane, vol in rows:
-            io = int(io)
-            if io_type is not None and io != io_type:
-                continue
-            lane_nums.add(int(lane))
-            total_vol += int(float(vol))
-        return total_vol, len(lane_nums)
+    # XML/정규식 혼용 가능하지만, 기존 코드 스타일(정규식) 유지하면서 안전하게 그룹핑
+    import re
+    rows = re.findall(
+        rf"<row>.*?<io_type>(\d+)</io_type>.*?<lane_num>(\d+)</lane_num>.*?<vol>{number_pattern}</vol>.*?</row>",
+        text,
+        flags=re.DOTALL,
+    )
+    if not rows:
+        return {}
+
+    sums: Dict[int, int] = {}
+    lanes: Dict[int, set] = {}
+
+    for io, lane, vol in rows:
+        io_t = int(io)
+        if io_t not in (1, 2):
+            continue
+        ln = int(lane)
+        v = int(float(vol))
+
+        sums[io_t] = sums.get(io_t, 0) + v
+        lanes.setdefault(io_t, set()).add(ln)
+
+    return {t: (sums[t], len(lanes.get(t, set()))) for t in sums}
+
+# ✅ 기존 시그니처 호환용(필요한 io_type만 뽑는 래퍼)
+async def fetch_volume_from_topis(
+    spot_num: str,
+    ymd: str,
+    hh: str,
+    io_type: Optional[int] = None,
+) -> Tuple[int, int]:
+    all_map = await fetch_volume_from_topis_all(spot_num, ymd, hh)
+    if io_type is None:
+        # (유입+유출) 합산이 아니라, 여기서는 기존 호환용이므로 "둘 다 합친 total"을 반환하지 않음.
+        # 호출부에서 반드시 io_type을 지정하거나 all_map을 직접 써야 한다.
+        return (0, 0)
+    return all_map.get(io_type, (0, 0))
 
 
 # ------------------------------------------------
@@ -538,20 +580,24 @@ def upsert_speed_hist(db: Session, link_id: str, ts: datetime, speed: float, tra
         db.rollback()
         raise
 
-def upsert_volume_hist(db: Session, spot_num: str, direction: str, ts: datetime, vol: int, lane_cnt: Optional[int]):
+def upsert_volume_hist(db: Session, spot_num: str, io_direction: str, ts: datetime, vol: int, lane_cnt: Optional[int]):
     try:
         if _is_postgres(db):
             stmt = pg_insert(VolumeHist).values(
-                spot_num=spot_num, direction=direction, ts=ts, vol=vol, lane_cnt=lane_cnt
+                spot_num=spot_num,
+                io_direction=io_direction,
+                ts=ts,
+                vol=vol,
+                lane_cnt=lane_cnt,
             ).on_conflict_do_update(
-                index_elements=[VolumeHist.spot_num, VolumeHist.direction, VolumeHist.ts],
+                index_elements=[VolumeHist.spot_num, VolumeHist.io_direction, VolumeHist.ts],
                 set_={"vol": vol, "lane_cnt": lane_cnt},
             )
             db.execute(stmt)
             db.commit()
             return
 
-        rec = VolumeHist(spot_num=spot_num, direction=direction, ts=ts, vol=vol, lane_cnt=lane_cnt)
+        rec = VolumeHist(spot_num=spot_num, io_direction=io_direction, ts=ts, vol=vol, lane_cnt=lane_cnt)
         db.add(rec)
         db.commit()
 
@@ -590,12 +636,9 @@ def bulk_upsert_speed_hist(
         n += 1
     return n
 
-def bulk_upsert_volume_hist(
-    db: Session,
-    rows: List[Dict],
-):
+def bulk_upsert_volume_hist(db: Session, rows: List[Dict]):
     """
-    rows: [{"spot_num":..., "direction":..., "ts":..., "vol":..., "lane_cnt":...}, ...]
+    rows: [{"spot_num":..., "io_direction":..., "ts":..., "vol":..., "lane_cnt":...}, ...]
     """
     if not rows:
         return 0
@@ -615,7 +658,7 @@ def bulk_upsert_volume_hist(
 
     n = 0
     for r in rows:
-        upsert_volume_hist(db, r["spot_num"], r["direction"], r["ts"], r["vol"], r.get("lane_cnt"))
+        upsert_volume_hist(db, r["spot_num"], r["io_direction"], r["ts"], r["vol"], r.get("lane_cnt"))
         n += 1
     return n
 
@@ -702,38 +745,35 @@ async def backfill_volume(
     end_kst = _kst_hour_floor(end_ts)
     start_kst = end_kst - timedelta(hours=hours - 1)
 
-    def _dir_from_io(x: int) -> str:
-        return "유입" if x == 1 else "유출"
-
-    io_list = [1, 2] if io_type is None else [io_type]
-    if any(x not in (1, 2) for x in io_list):
+    target_types = [1, 2] if io_type is None else [io_type]
+    if any(t not in (1, 2) for t in target_types):
         raise ValueError("io_type은 1(유입), 2(유출), None 중 하나여야 합니다.")
 
     rows = []
     errors = []
+
     for i in range(hours):
         ts = start_kst + timedelta(hours=i)
-        ymd = ts.strftime("%Y%m%d")
-        hh = ts.strftime("%H")
+        ymd, hh = _ymd_hh_from_ts(ts)
 
-        for io in io_list:
-            try:
-                total_vol, lane_cnt = await fetch_volume_from_topis(
-                    spot_num=spot_num, ymd=ymd, hh=hh, io_type=io
-                )
+        try:
+            all_map = await fetch_volume_from_topis_all(spot_num=spot_num, ymd=ymd, hh=hh)
+            for t in target_types:
+                if t not in all_map:
+                    continue
+                total_vol, lane_cnt = all_map[t]
                 rows.append({
                     "spot_num": spot_num,
-                    "direction": _dir_from_io(io),
+                    "io_direction": IO_TYPE_TO_DIR[t],
                     "ts": ts,
                     "vol": int(total_vol),
                     "lane_cnt": int(lane_cnt),
                 })
-            except Exception as e:
-                errors.append({"ts": ts, "io_type": io, "error": str(e)})
+        except Exception as e:
+            errors.append({"ts": ts, "spot_num": spot_num, "error": str(e)})
 
-            # TOPIS 호출 과다 방지(짧게)
-            if sleep_sec > 0:
-                await asyncio.sleep(sleep_sec)
+        if sleep_sec > 0:
+            await asyncio.sleep(sleep_sec)
 
     inserted = bulk_upsert_volume_hist(db, rows)
 
@@ -745,9 +785,10 @@ async def backfill_volume(
         "io_type": io_type,
         "requested_rows": len(rows),
         "inserted": inserted,
-        "errors": errors[:20],  # 너무 길어질 수 있어서 상위 20개만 반환
+        "errors": errors[:20],
         "error_count": len(errors),
     }
+
 
 def seed_speed_dummy_for_road(
     db: Session,
@@ -791,30 +832,65 @@ async def backfill_volume_for_road(
     road_name: str,
     hours: int = 72,
     end_ts: Optional[datetime] = None,
-    io_type: Optional[int] = None,
-    directions: Optional[List[str]] = None,
+    io_directions: Optional[List[str]] = None,
+    sleep_sec: float = 0.05,
 ) -> dict:
     static = get_static_meta()
-    spot_dirs = static.find_spot_dirs_by_road(road_name, directions=directions)
-    if not spot_dirs:
+
+    dirs = io_directions or ["유입", "유출"]
+    for d in dirs:
+        if d not in ("유입", "유출"):
+            raise ValueError("io_directions는 ['유입','유출']만 허용합니다.")
+
+    spot_dir_ids = static.find_spot_dirs_by_road(road_name, io_directions=dirs)
+    if not spot_dir_ids:
         return {"road_name": road_name, "spots": 0, "hours": hours, "message": "해당 도로의 volume spot이 없습니다."}
 
-    # spot_num 단위로 묶기 (A-01_유입, A-01_유출 -> A-01)
-    spot_nums = sorted({sid.split("_", 1)[0] for sid in spot_dirs})
+    # spot_num -> 필요한 io_type set 구성 (시간당 spot_num당 1회 호출)
+    need: Dict[str, set] = {}
+    for sid in spot_dir_ids:
+        spot_num, io_dir = sid.split("_", 1)
+        need.setdefault(spot_num, set()).add(DIR_TO_IO_TYPE[io_dir])
 
-    results = []
-    for sn in spot_nums:
-        r = await backfill_volume(
-            db=db,
-            spot_num=sn,
-            hours=hours,
-            end_ts=end_ts,
-            io_type=io_type,
-            sleep_sec=0.05,
-        )
-        results.append({"spot_num": sn, "result": r})
+    end_kst = _kst_hour_floor(end_ts)
+    start_kst = end_kst - timedelta(hours=hours - 1)
 
-    return {"road_name": road_name, "spots": len(spot_nums), "hours": hours, "results": results}
+    inserted = 0
+    skipped = 0
+    errors = []
+
+    for i in range(hours):
+        ts = start_kst + timedelta(hours=i)
+        ymd, hh = _ymd_hh_from_ts(ts)
+
+        for spot_num, need_types in need.items():
+            try:
+                all_map = await fetch_volume_from_topis_all(spot_num=spot_num, ymd=ymd, hh=hh)
+                for t in need_types:
+                    if t not in all_map:
+                        skipped += 1
+                        continue
+                    total_vol, lane_cnt = all_map[t]
+                    upsert_volume_hist(db, spot_num, IO_TYPE_TO_DIR[t], ts, int(total_vol), int(lane_cnt))
+                    inserted += 1
+            except Exception as e:
+                errors.append({"ts": ts, "spot_num": spot_num, "error": str(e)})
+
+            if sleep_sec > 0:
+                await asyncio.sleep(sleep_sec)
+
+    return {
+        "road_name": road_name,
+        "hours": hours,
+        "start_ts_kst": start_kst,
+        "end_ts_kst": end_kst,
+        "io_directions": dirs,
+        "spots": list(need.keys()),
+        "inserted": inserted,
+        "skipped": skipped,
+        "error_count": len(errors),
+        "errors": errors[:20],
+    }
 
 
 # ------------------------------------------------
@@ -834,12 +910,11 @@ def get_speed_hist_window(db: Session, link_id: str, T: int) -> pd.DataFrame:
         raise ValueError(f"속도 히스토리가 부족합니다. 필요:{need} 현재:{len(rows)}")
     return pd.DataFrame([{"ts": r.ts, "speed": r.speed} for r in rows])
 
-
-def get_volume_hist_window(db: Session, spot_num: str, direction: str, T: int) -> pd.DataFrame:
+def get_volume_hist_window(db: Session, spot_num: str, io_direction: str, T: int) -> pd.DataFrame:
     need = T + 24
     rows = (
         db.query(VolumeHist)
-        .filter(VolumeHist.spot_num == spot_num, VolumeHist.direction == direction)
+        .filter(VolumeHist.spot_num == spot_num, VolumeHist.io_direction == io_direction)
         .order_by(VolumeHist.ts.desc())
         .limit(T + 96)
         .all()
@@ -880,19 +955,19 @@ def predict_segment(db: Session, req: SegmentPredictRequest) -> SegmentForecastR
     vol_forecast = None
     vol_load = None
 
-    if req.spot_num and req.direction:
+    if req.spot_num and req.io_direction:
         vol_model = get_vol_model()
 
-        hist_vol = get_volume_hist_window(db, req.spot_num, req.direction, vol_model.T)
-        vol_pred, vol_ts, _ = vol_model.predict(req.spot_num, req.direction, hist_vol, horizon=H_use)
+        hist_vol = get_volume_hist_window(db, req.spot_num, req.io_direction, vol_model.T)
+        vol_pred, vol_ts, _ = vol_model.predict(req.spot_num, req.io_direction, hist_vol, horizon=H_use)
 
-        meta_vol = static_meta.get_vol_meta(req.spot_num, req.direction)
+        meta_vol = static_meta.get_vol_meta(req.spot_num, req.io_direction)
         max_vol = float(meta_vol["spot_max_vol"])
         vol_load = np.clip(vol_pred / (max_vol + 1e-6), 0.0, 1.0)
 
         vol_forecast = VolumeForecast(
             spot_num=req.spot_num,
-            direction=req.direction,
+            io_direction=req.io_direction,
             road_name=meta_vol["road_name"],
             max_vol=max_vol,
             predictions=[
@@ -915,7 +990,7 @@ def predict_segment(db: Session, req: SegmentPredictRequest) -> SegmentForecastR
         road_name=speed_forecast.road_name,
         link_id=req.link_id,
         spot_num=req.spot_num,
-        direction=req.direction,
+        io_direction=req.io_direction,
         horizon=H_use,
         combined_index=combined,
     )
@@ -938,7 +1013,7 @@ def predict_road(db: Session, req: RoadPredictRequest) -> RoadForecastResponse:
 
     spot_dir_ids: List[str] = []
     if req.include_volume and static_meta.vol_meta:
-        spot_dir_ids = static_meta.find_spot_dirs_by_road(req.road_name, directions=req.directions)
+        spot_dir_ids = static_meta.find_spot_dirs_by_road(req.road_name, io_directions=req.io_directions)
 
     # --- 1) 공통 anchor_ts 계산 (speed/volume 모두 시간축 정렬) ---
     speed_end_list: List[datetime] = []
@@ -1006,20 +1081,20 @@ def predict_road(db: Session, req: RoadPredictRequest) -> RoadForecastResponse:
         for sid in spot_dir_ids:
             if sid in missing_volume_spots:
                 continue
-            spot_num, direction = sid.split("_", 1)
-            hist_vol = get_volume_hist_window(db, spot_num, direction, vol_model.T)
+            spot_num, io_dir = sid.split("_", 1)
+            hist_vol = get_volume_hist_window(db, spot_num, io_dir, vol_model.T)
 
             v_hat, v_future_ts, _ = vol_model.predict(
-                spot_num, direction, hist_vol, horizon=H_use, anchor_end_ts_kst=anchor_ts
+                spot_num, io_dir, hist_vol, horizon=H_use, anchor_end_ts_kst=anchor_ts
             )
-            meta_v = static_meta.get_vol_meta(spot_num, direction)
+            meta_v = static_meta.get_vol_meta(spot_num, io_dir)
             max_vol = float(meta_v["spot_max_vol"])
             load_idx = np.clip(v_hat / (max_vol + 1e-6), 0.0, 1.0)
 
             volume_spots.append(
                 VolumeForecast(
                     spot_num=spot_num,
-                    direction=direction,
+                    io_direction=io_dir,
                     road_name=meta_v["road_name"],
                     max_vol=max_vol,
                     predictions=[

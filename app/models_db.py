@@ -6,6 +6,7 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 from .db import Base
 
+
 class SpeedHist(Base):
     __tablename__ = "speed_hist"
     id = Column(Integer, primary_key=True, index=True)
@@ -24,7 +25,10 @@ class VolumeHist(Base):
     __tablename__ = "volume_hist"
     id = Column(Integer, primary_key=True, index=True)
     spot_num = Column(String(10), index=True, nullable=False)     # A-01
-    direction = Column(String(10), nullable=False)                # '유입' / '유출'
+
+    # ✅ DB 컬럼명은 "direction" 그대로, 파이썬 속성명만 io_direction으로 변경
+    io_direction = Column("direction", String(10), nullable=False)  # '유입' / '유출'
+
     ts = Column(DateTime(timezone=True), index=True, nullable=False)
     vol = Column(Integer, nullable=False)                         # 차로 합산 교통량
     lane_cnt = Column(Integer, nullable=True)
