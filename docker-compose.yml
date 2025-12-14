@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    container_name: metrovision-db
+    restart: always
+    environment:
+      POSTGRES_USER: metro
+      POSTGRES_PASSWORD: metro
+      POSTGRES_DB: metrovision
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  api:
+    build: .
+    container_name: metrovision-api
+    restart: always
+    depends_on:
+      - db
+    env_file:
+      - .env
+    volumes:
+      - ./data:/workspace/data
+      - ./models:/workspace/models
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
+
