@@ -7,6 +7,10 @@
 * **Frontend**: Streamlit + Plotly 대시보드
 * **Run**: Docker Compose로 DB/API/UI 원클릭 구동
 
+### **!TOPIS(OpenAPI) key 발급!**
+
+**https://topis.seoul.go.kr/refRoom/openRefRoom_4.do**
+
 ---
 
 ## 0) Demo
@@ -375,6 +379,50 @@ curl -X POST http://localhost:8000/api/predict/segment \
   }'
 ```
 
+### 13.4 Road Volume Backfill 요청 예시
+
+```bash
+curl -X 'POST' \
+  'http://localhost:8000/api/admin/backfill-road-volume' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "road_name": "동일로",
+  "hours": 72,
+  "end_ts": "2025-12-14T20:54:33.730Z"
+}'
+```
+
+### 13.5 Road Volume Backfill 응답 예시
+
+```json
+{
+  "road_name": "동일로",
+  "hours": 72,
+  "start_ts_kst": "2025-12-12T06:00:00+09:00",
+  "end_ts_kst": "2025-12-15T05:00:00+09:00",
+  "io_directions": [
+    "유입",
+    "유출"
+  ],
+  "spots": [
+    "B-02",
+    "D-07",
+    "D-13"
+  ],
+  "inserted": 424,
+  "skipped": 6,
+  "error_count": 1,
+  "errors": [
+    {
+      "ts": "2025-12-14T06:00:00+09:00",
+      "spot_num": "B-02",
+      "error": "Server disconnected without sending a response."
+    }
+  ]
+}
+```
+
 ---
 
 ## 14) Dashboard (Streamlit)
@@ -433,7 +481,7 @@ UI 기능 요약:
 * 해결:
 
   * 더미 삽입: `/api/admin/seed-speed-dummy` 또는 `/api/admin/seed-road-speed-dummy`
-  * TOPIS 백필: `/api/admin/backfill-volume` 등
+  * TOPIS 백필: `/api/admin/backfill-road-volum` 등
 
 ### 16.2 TOPIS 호출 실패
 
